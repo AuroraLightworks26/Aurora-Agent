@@ -1,0 +1,105 @@
+# ==========================================
+# Go Rules
+# ==========================================
+# Compiled binaries / executables
+/cmd/othello-sim/othello-sim
+*.exe
+*.exe;
+*.dll
+*.so
+*.dylib
+
+# Test binaries and profiles
+*.test
+*.out
+*.pprof
+cpu.pprof
+mem.pprof
+
+# Go vendor directory (if used)
+/vendor/
+
+# Go workspaces
+go.work
+go.work.sum
+
+# Build artifacts
+build/
+*.so
+*.dll
+*.dylib
+*.h
+
+# ==========================================
+# Python & Virtual Environments
+# ==========================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter / IPython
+.ipynb_checkpoints
+
+
+# ==========================================
+# Project-Specific (PyTorch, Models, TensorBoard)
+# ==========================================
+# PyTorch Checkpoints & Saved Models
+*.pth
+*.pt
+*.onnx
+/models/
+
+# TensorBoard Logs & Local Runs
+/runs/
+*.tfevents.*
+
+
+# ==========================================
+# IDEs, Editors & OS Files
+# ==========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VS Code / JetBrains / Editors
+.vscode/
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variable files
+.env
+.env.local
+
+# Database files
+*.db
