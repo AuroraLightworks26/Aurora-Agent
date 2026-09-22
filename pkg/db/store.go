@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sysagent/pkg/pipeline"
+	"time"
 
 	_ "modernc.org/sqlite" // Pure Go SQLite driver
 )
@@ -21,6 +22,22 @@ type PastMemory struct {
 	Success      bool
 	ErrorMessage string
 	Similarity   float32
+}
+
+// SystemProfileEntry represents a cached fact about the host machine.
+type SystemProfileEntry struct {
+	Category  string    `json:"category"`
+	Attribute string    `json:"attribute"`
+	Value     string    `json:"value"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// SystemQuirk represents a learned behavior, library trap, or quirk.
+type SystemQuirk struct {
+	ID          int64     `json:"id"`
+	ContextKey  string    `json:"context_key"`
+	Description string    `json:"description"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 func NewStore(dbPath string) (*Store, error) {
@@ -56,6 +73,30 @@ func (s *Store) migrate() error {
 	if err != nil {
 		return fmt.Errorf("failed executing migration schema: %w", err)
 	}
+
+	queryProfile := `
+	CREATE TABLE IF NOT EXISTS system_profile (
+		category TEXT,
+		attribute TEXT,
+		value TEXT,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (category, attribute)
+	);`
+	if _, err := s.conn.Exec(queryProfile); err != nil {
+		return fmt.Errorf("failed executing system_profile migration schema: %w", err)
+	}
+
+	queryQuirks := `
+	CREATE TABLE IF NOT EXISTS system_quirks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		context_key TEXT,
+		description TEXT,
+		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	if _, err := s.conn.Exec(queryQuirks); err != nil {
+		return fmt.Errorf("failed executing system_quirks migration schema: %w", err)
+	}
+
 	return nil
 }
 
@@ -151,4 +192,79 @@ func (s *Store) SearchRelevantMemories(queryVector []float32, similarityThreshol
 func (s *Store) DeleteMemory(id int64) error {
 	_, err := s.conn.Exec("DELETE FROM telemetry_logs WHERE id = ?", id)
 	return err
+}
+
+// SetSystemProfile upserts a fact into the agent's mental model of the machine.
+func (s *Store) SetSystemProfile(category, attribute, value string) error {
+	query := `
+	INSERT INTO system_profile (category, attribute, value, updated_at)
+	VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(category, attribute) DO UPDATE SET 
+		value = excluded.value,
+		updated_at = CURRENT_TIMESTAMP;
+	`
+	_, err := s.conn.Exec(query, category, attribute, value)
+	if err != nil {
+		return fmt.Errorf("failed to set system profile: %w", err)
+	}
+	return nil
+}
+
+// GetSystemProfile retrieves all cached facts about the host machine.
+func (s *Store) GetSystemProfile() ([]SystemProfileEntry, error) {
+	rows, err := s.conn.Query("SELECT category, attribute, value, updated_at FROM system_profile ORDER BY category;")
+	if err != nil {
+		return nil, fmt.Errorf("failed to query system profile: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []SystemProfileEntry
+	for rows.Next() {
+		var e SystemProfileEntry
+		if err := rows.Scan(&e.Category, &e.Attribute, &e.Value, &e.UpdatedAt); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+// LogSystemQuirk records an operational quirk or library trap.
+func (s *Store) LogSystemQuirk(contextKey, description string) error {
+	query := `INSERT INTO system_quirks (context_key, description, timestamp) VALUES (?, ?, CURRENT_TIMESTAMP);`
+	_, err := s.conn.Exec(query, contextKey, description)
+	return err
+}
+
+// GetSystemQuirks retrieves all known system quirks.
+func (s *Store) GetSystemQuirks() ([]SystemQuirk, error) {
+	rows, err := s.conn.Query("SELECT id, context_key, description, timestamp FROM system_quirks ORDER BY timestamp DESC;")
+	if err != nil {
+		return nil, fmt.Errorf("failed to query quirks: %w", err)
+	}
+	defer rows.Close()
+
+	var quirks []SystemQuirk
+	for rows.Next() {
+		var q SystemQuirk
+		if err := rows.Scan(&q.ID, &q.ContextKey, &q.Description, &q.Timestamp); err != nil {
+			continue
+		}
+		quirks = append(quirks, q)
+	}
+	return quirks, nil
+}
+
+// CorrectQuirk allows updating an existing quirk description if the agent's understanding changes.
+func (s *Store) CorrectQuirk(id int64, newDescription string) error {
+	query := `UPDATE system_quirks SET description = ?, timestamp = CURRENT_TIMESTAMP WHERE id = ?;`
+	res, err := s.conn.Exec(query, newDescription, id)
+	if err != nil {
+		return fmt.Errorf("failed to update quirk: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("no quirk found with ID %d", id)
+	}
+	return nil
 }

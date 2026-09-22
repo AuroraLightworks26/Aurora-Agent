@@ -2,6 +2,7 @@ package ollama
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,36 +11,97 @@ import (
 	"time"
 )
 
-const DefaultURL = "http://localhost:11435"
+const DefaultURL = "http://localhost:11434"
 
 type Client struct {
 	URL        string
-	Model      string
 	HTTPClient *http.Client // 🚨 Add an internal reusable client handle field
 }
 
-func NewClient(model string) *Client {
+// NewClient accepts an optional baseURL. If empty, it defaults to DefaultURL.
+func NewClient(baseURL string) *Client {
+	if baseURL == "" {
+		baseURL = DefaultURL
+	}
 	return &Client{
-		URL:   "http://localhost:11434", // Adjust if your local Ollama port differs
-		Model: model,
+		URL: baseURL,
 		HTTPClient: &http.Client{
-			Timeout: 10 * time.Second, // 🚨 CRITICAL GUARDRAIL: Automatically breaks the lock if Ollama hangs for more than 10 seconds
+			Timeout: 180 * time.Second, // Global timeout to prevent VRAM swapping deadlocks
 		},
 	}
 }
 
-// GeneratePlanWithMemory queries the 14B model, handles structural JSON schemas, and adapts to variations.
-func (c *Client) GeneratePlanWithMemory(userPrompt string, memories []string) (*PipelinePlan, error) {
-	systemInstruction := "You are a senior Linux systems engineering planner. Break the user's high-level request down into individual, low-level shell commands. Identify which commands can run concurrently and which depend on previous steps. " +
-		"CRITICAL MANDATE: You MUST always generate the requested steps and commands. Even if historical data shows a command failed or implies a file does not exist, do not return an empty array. Always produce the functional commands so the system execution engine can evaluate them."
+// GeneratePlanWithMemory queries the 14B model with historical memories, profiles, and quirks.
+func (c *Client) GeneratePlanWithMemory(userPrompt string, memories []string, profileStrs []string, quirkStrs []string) (*PipelinePlan, error) {
+	fmt.Println("  ⏳ [Ollama] Sending context payload to 7B Architect...")
+
+	systemInstruction := `You are SysAgent, an expert Linux system administration engine.
+Generate a strictly formatted JSON plan for the user request.
+
+CRITICAL EXECUTION CONSTRAINTS:
+1. NEVER output interactive file editor commands like 'nano', 'vim', 'vi', or 'emacs'.
+2. NEVER create separate steps just to "edit" or "open" a file.
+3. To modify or append to files, directly use non-interactive commands like 'echo "text" | sudo tee -a /file' or 'sed -i ...'.
+4. NEVER issue 'reboot' or 'shutdown' commands.
+
+Return JSON in this format:
+{
+  "reasoning": "explanation",
+  "steps": [
+    {
+      "id": "phase_id",
+      "command": "non-interactive bash command",
+      "depends_on": [],
+      "reason": "purpose"
+    }
+  ]
+}`
+	// 🧠 INJECT SYSTEM PROFILE STATE
+	if len(profileStrs) > 0 {
+		systemInstruction += "\n\n[HOST SYSTEM PROFILE (Cached Facts)]:\n" + strings.Join(profileStrs, "\n")
+	}
+
+	// 🧠 INJECT KNOWN QUIRKS
+	if len(quirkStrs) > 0 {
+		systemInstruction += "\n\n[KNOWN SYSTEM QUIRKS & TRAPS]:\n" + strings.Join(quirkStrs, "\n")
+	}
 
 	if len(memories) > 0 {
-		systemInstruction += "\n\nCRITICAL CONTEXT: Here is historical data about how this system handled similar commands in the past. Use this history to avoid repeating previous mistakes or to mimic successful structural sequences:\n" + strings.Join(memories, "\n")
+		systemInstruction += "\n\n[HISTORICAL EXECUTION CONTEXT]:\n" + strings.Join(memories, "\n")
 	}
 
 	schema := FormatSchema{
 		Type: "object",
 		Properties: map[string]interface{}{
+			"reasoning": map[string]string{"type": "string"},
+			"mental_model_updates": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"new_quirks": map[string]interface{}{
+						"type": "array",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"context_key": map[string]string{"type": "string"},
+								"description": map[string]string{"type": "string"},
+							},
+							"required": []string{"context_key", "description"},
+						},
+					},
+					"profile_updates": map[string]interface{}{
+						"type": "array",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"category":  map[string]string{"type": "string"},
+								"attribute": map[string]string{"type": "string"},
+								"value":     map[string]string{"type": "string"},
+							},
+							"required": []string{"category", "attribute", "value"},
+						},
+					},
+				},
+			},
 			"steps": map[string]interface{}{
 				"type": "array",
 				"items": map[string]interface{}{
@@ -58,7 +120,7 @@ func (c *Client) GeneratePlanWithMemory(userPrompt string, memories []string) (*
 	}
 
 	payload := map[string]interface{}{
-		"model":  c.Model,
+		"model":  "qwen2.5-coder:7b",
 		"prompt": userPrompt,
 		"system": systemInstruction,
 		"stream": false,
@@ -67,7 +129,7 @@ func (c *Client) GeneratePlanWithMemory(userPrompt string, memories []string) (*
 			NumCtx:      4096,
 			Temperature: 0.0,
 		},
-		"keep_alive": 0, // 🚨 CRITICAL: Forces Ollama to flush the 14B model from VRAM instantly after inference
+		"keep_alive": 0,
 	}
 
 	jsonData, err := json.Marshal(payload)
@@ -75,7 +137,7 @@ func (c *Client) GeneratePlanWithMemory(userPrompt string, memories []string) (*
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := http.Post(c.URL+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
+	resp, err := c.HTTPClient.Post(c.URL+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed running http post to ollama: %w", err)
 	}
@@ -86,7 +148,8 @@ func (c *Client) GeneratePlanWithMemory(userPrompt string, memories []string) (*
 		return nil, fmt.Errorf("failed reading response body: %w", err)
 	}
 
-	// 1. Decode Ollama's main wrapper block
+	fmt.Println("  ⚡ [Ollama] Plan received from 7B Architect. Parsing JSON...")
+
 	var outerResp struct {
 		Response string `json:"response"`
 	}
@@ -95,20 +158,16 @@ func (c *Client) GeneratePlanWithMemory(userPrompt string, memories []string) (*
 	}
 
 	var plan PipelinePlan
-
-	// 2. ADAPTIVE PARSING LAYER: Try parsing as the standard wrapped JSON object first
 	if err := json.Unmarshal([]byte(outerResp.Response), &plan); err == nil && len(plan.Steps) > 0 {
 		return &plan, nil
 	}
 
-	// 3. Fallback: If 'steps' array was empty or failed, try parsing it as a direct un-nested slice
 	var flatSteps []TaskStep
 	if err := json.Unmarshal([]byte(outerResp.Response), &flatSteps); err == nil && len(flatSteps) > 0 {
 		plan.Steps = flatSteps
 		return &plan, nil
 	}
 
-	// 4. Detailed error boundary fallback to see exactly what the model spit out if both fail
 	return nil, fmt.Errorf("model response did not fit steps schema. Raw response content: %s", outerResp.Response)
 }
 
@@ -145,9 +204,67 @@ func (c *Client) GetEmbedding(text string) ([]float32, error) {
 	return embedResp.Embedding, nil
 }
 
-// AnalyzeCommandFailure runs the lightweight 1.5B base model to interpret terminal error outputs.
+// / AnalyzeCommandFailure runs the default 1.5B model to interpret terminal error outputs.
 func (c *Client) AnalyzeCommandFailure(command string, errorMsg string) (string, error) {
-	// 🚨 FORCE TARGET BOUNDARY MARKER IN THE INSTRUCTION PROMPT
+	return c.AnalyzeCommandFailureWithModel("qwen2.5-coder:1.5b", command, errorMsg)
+}
+
+// GenerateWithModel sends a prompt to a specified Ollama model with custom options and stop tokens.
+func (c *Client) GenerateWithModel(ctx context.Context, model string, prompt string) (string, error) {
+	payload := map[string]interface{}{
+		"model":      model,
+		"prompt":     prompt,
+		"stream":     false,
+		"keep_alive": 0,
+		"options": map[string]interface{}{
+			"temperature": 0.1,
+			"num_ctx":     2048,
+			"stop":        []string{"[END]", "User:", "\n\nUser"},
+		},
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.URL+"/api/generate", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create http request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed executing HTTP post to ollama: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed reading response body: %w", err)
+	}
+
+	var outerResp struct {
+		Response string `json:"response"`
+	}
+	if err := json.Unmarshal(bodyBytes, &outerResp); err != nil {
+		return "", fmt.Errorf("failed decoding ollama structure: %w", err)
+	}
+
+	cleanedResponse := strings.TrimSpace(outerResp.Response)
+	cleanedResponse = strings.TrimSuffix(cleanedResponse, "[END]")
+	return strings.TrimSpace(cleanedResponse), nil
+}
+
+func (c *Client) AnalyzeCommandFailureWithModel(model string, command string, errorMsg string) (string, error) {
+	// ⏱️ Set a strict 45-second deadline so the Go client never blocks indefinitely
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	// Brief pause to allow the Ollama daemon to finish VRAM state transitions
+	time.Sleep(500 * time.Millisecond)
+
 	prompt := fmt.Sprintf("Context: A Linux system administration command failed.\n"+
 		"Command executed: %s\n"+
 		"Error output captured: %s\n\n"+
@@ -155,14 +272,13 @@ func (c *Client) AnalyzeCommandFailure(command string, errorMsg string) (string,
 		"Explanation: ", command, errorMsg)
 
 	payload := map[string]interface{}{
-		"model":      "qwen2.5-coder:1.5b",
-		"prompt":     prompt,
-		"stream":     false,
-		"keep_alive": 0,
+		"model":  model,
+		"prompt": prompt,
+		"stream": false,
 		"options": map[string]interface{}{
-			"temperature": 0.3, // 🚨 Slightly increase creativity to prevent immediate token starvation loops
+			"temperature": 0.2,
 			"num_ctx":     2048,
-			"stop":        []string{"[END]"}, // 🚨 NARROW LIMITS: Rely entirely on your unique marker token tag to cut generations
+			"stop":        []string{"[END]"},
 		},
 	}
 
@@ -171,10 +287,15 @@ func (c *Client) AnalyzeCommandFailure(command string, errorMsg string) (string,
 		return "", err
 	}
 
-	resp, err := c.HTTPClient.Post(c.URL+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
-
+	req, err := http.NewRequestWithContext(ctx, "POST", c.URL+"/api/generate", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("ollama request timed out or failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -183,8 +304,6 @@ func (c *Client) AnalyzeCommandFailure(command string, errorMsg string) (string,
 		return "", err
 	}
 
-	// fmt.Printf("\n🔍 [DEBUG] Raw Ollama API Response Payload: %s\n", string(bodyBytes))
-
 	var outerResp struct {
 		Response string `json:"response"`
 	}
@@ -192,10 +311,7 @@ func (c *Client) AnalyzeCommandFailure(command string, errorMsg string) (string,
 		return "", err
 	}
 
-	// 🚨 CLEANUP: In case the stop gate lets a tiny boundary fragment slip into the string buffer, trim it away
 	cleanedResponse := strings.TrimSpace(outerResp.Response)
 	cleanedResponse = strings.TrimSuffix(cleanedResponse, "[END]")
-	cleanedResponse = strings.TrimSpace(cleanedResponse)
-
-	return "1. " + cleanedResponse, nil
+	return "1. " + strings.TrimSpace(cleanedResponse), nil
 }

@@ -26,19 +26,26 @@ func main() {
 		<-sigChan
 		fmt.Println("\n🛑 Early termination requested. Cleaning up model processes...")
 
-		// Instantly notify local Ollama daemon to unload memory models
-		stopPayload := map[string]interface{}{
-			"model":      "qwen2.5-coder:14b",
-			"keep_alive": "0s",
+		// Target the active model tiers in your hierarchical pipeline
+		activeModels := []string{
+			"qwen2.5-coder:7b",
+			"qwen2.5-coder:1.5b",
+			"qwen2.5-coder:14b",
 		}
-		jsonData, _ := json.Marshal(stopPayload)
-		_, _ = http.Post("http://localhost:11434/api/generate", "application/json", bytes.NewBuffer(jsonData))
 
-		stopPayload["model"] = "qwen2.5-coder:1.5b-base"
-		jsonData, _ = json.Marshal(stopPayload)
-		_, _ = http.Post("http://localhost:11434/api/generate", "application/json", bytes.NewBuffer(jsonData))
+		for _, model := range activeModels {
+			stopPayload := map[string]interface{}{
+				"model":      model,
+				"keep_alive": "0s",
+			}
 
-		os.Exit(130) // Standard Linux script abort exit status code status
+			pingURL := fmt.Sprintf("%s/api/generate", ollama.DefaultURL)
+
+			jsonData, _ := json.Marshal(stopPayload)
+			_, _ = http.Post(pingURL, "application/json", bytes.NewBuffer(jsonData))
+		}
+
+		os.Exit(130) // Standard Linux script abort exit status code
 	}()
 
 	store, err := db.NewStore("agent_knowledge.db")
@@ -48,7 +55,7 @@ func main() {
 	}
 	defer store.Close()
 
-	client := ollama.NewClient("qwen2.5-coder:14b")
+	client := ollama.NewClient(ollama.DefaultURL)
 
 	switch os.Args[1] {
 	case "--history":

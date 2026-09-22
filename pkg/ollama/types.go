@@ -8,9 +8,23 @@ type TaskStep struct {
 	Reason    string   `json:"reason"`
 }
 
+type MentalModelUpdates struct {
+	NewQuirks []struct {
+		ContextKey  string `json:"context_key"`
+		Description string `json:"description"`
+	} `json:"new_quirks"`
+	ProfileUpdates []struct {
+		Category  string `json:"category"`
+		Attribute string `json:"attribute"`
+		Value     string `json:"value"`
+	} `json:"profile_updates"`
+}
+
 // PipelinePlan represents the collection of steps decoded from Ollama.
 type PipelinePlan struct {
-	Steps []TaskStep `json:"steps"`
+	Reasoning          string             `json:"reasoning,omitempty"`
+	MentalModelUpdates MentalModelUpdates `json:"mental_model_updates,omitempty"`
+	Steps              []TaskStep         `json:"steps"`
 }
 
 // OllamaOptions protects your VRAM from context explosion.

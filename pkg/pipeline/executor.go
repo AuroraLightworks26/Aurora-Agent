@@ -5,12 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/user"
-	"strconv"
 	"strings"
 	"sync"
 	"sysagent/pkg/ollama"
-	"syscall"
 	"time"
 )
 
@@ -22,7 +19,7 @@ type TaskResult struct {
 	ErrorMsg string
 }
 
-// Engine orchestrates the concurrent execution of task graphs.
+// Engine orchestrates the execution of task graphs.
 type Engine struct {
 	Plan *ollama.PipelinePlan
 }
@@ -31,7 +28,6 @@ func NewEngine(plan *ollama.PipelinePlan) *Engine {
 	return &Engine{Plan: plan}
 }
 
-// ExecuteGraph runs tracks while dropping privileges to 'sysagent' EXCEPT when explicit sudo elevation is active.
 func (e *Engine) ExecuteGraph(ctx context.Context) []TaskResult {
 	var wg sync.WaitGroup
 	var resultsMutex sync.Mutex
@@ -45,30 +41,37 @@ func (e *Engine) ExecuteGraph(ctx context.Context) []TaskResult {
 		completedChannels[step.ID] = make(chan bool, 1)
 	}
 
-	// 🔒 Pre-cache the 'sysagent' restricted system credentials
-	var sandboxAttr *syscall.SysProcAttr
-	agentUser, err := user.Lookup("sysagent")
-	if err == nil {
-		uid, _ := strconv.Atoi(agentUser.Uid)
-		gid, _ := strconv.Atoi(agentUser.Gid)
-		sandboxAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{
-				Uid: uint32(uid),
-				Gid: uint32(gid),
-			},
-		}
-	}
+	commandCounts := make(map[string]int)
+	const maxRepeatedCommands = 3
 
 	fmt.Printf("\n⚡ Initiating Execution Engine for %d structural phases...\n", len(e.Plan.Steps))
 
 	for _, step := range e.Plan.Steps {
+		resultsMutex.Lock()
+		commandCounts[step.Command]++
+		if commandCounts[step.Command] >= maxRepeatedCommands {
+			fmt.Printf("\n\033[1;31m🚨 [LOOP GUARD TRIPPED] Command '%s' has executed %d times recursively.\n"+
+				"    Aborting execution flow to prevent infinite loop or host resource exhaustion.\033[0m\n",
+				step.Command, commandCounts[step.Command])
+
+			res := TaskResult{
+				ID:       step.ID,
+				Command:  step.Command,
+				Success:  false,
+				ErrorMsg: "Execution halted by internal Loop Guard circuit breaker (repeated command limit reached).",
+			}
+			results = append(results, res)
+			resultsMutex.Unlock()
+			break
+		}
+		resultsMutex.Unlock()
+
 		isInteractive := strings.Contains(step.Command, "sudo")
 		wg.Add(1)
 
 		go func(s ollama.TaskStep, interactive bool) {
 			defer wg.Done()
 
-			// Block execution thread until parent dependency channels unlock
 			for _, depID := range s.DependsOn {
 				ch, exists := completedChannels[depID]
 				if exists {
@@ -112,10 +115,8 @@ func (e *Engine) ExecuteGraph(ctx context.Context) []TaskResult {
 
 			cmd := exec.CommandContext(ctx, "bash", "-c", s.Command)
 
-			// 🚨 ADAPTIVE ELEVATION GATEWAYS
+			// Route interactive/sudo commands to the active TTY for password prompts
 			if interactive {
-				// If sudo is active, DO NOT drop credentials to 'sysagent'.
-				// We keep your active user execution frame context so sudo can bind to your active keyboard.
 				fmt.Printf("🔑 [Elevation Bypass] Phase %s requires administrative context. Routing to system TTY...\n", s.ID)
 				fmt.Printf("🛠️  [Executing] %s: %s\n", s.ID, s.Command)
 
@@ -152,12 +153,7 @@ func (e *Engine) ExecuteGraph(ctx context.Context) []TaskResult {
 				return
 			}
 
-			// Standard Sandboxed Track: Enforce sysagent restrictions for unprivileged tasks
-			if sandboxAttr != nil {
-				cmd.SysProcAttr = sandboxAttr
-			}
-
-			fmt.Printf("🔒 [Sandboxed] Phase %s running as user 'sysagent'\n", s.ID)
+			// Standard execution context (runs directly as the user invoking sysagent)
 			fmt.Printf("🛠️  [Executing] %s: %s\n", s.ID, s.Command)
 
 			cmd.Stdin = os.Stdin
